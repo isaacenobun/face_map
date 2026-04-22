@@ -39,9 +39,9 @@ from .models import FaceMap
 # ── stream / recognition config ───────────────────────────────────────────────
 DEFAULT_RTSP_URL = "rtsp://admin:trace321@192.168.100.64:554/Streaming/Channels/101"
 FPS              = 10           # ffmpeg output frame rate
-SCALE            = "2000:-1"    # higher res → better face detail for recognition
+SCALE            = "1280:-1"    # higher res → better face detail for recognition
                                  # use "640:-1" if CPU can't keep up
-RECOG_FPS        = 10            # max face-recognition passes per second
+RECOG_FPS        = 6            # max face-recognition passes per second
 MATCH_THRESH     = 0.4          # cosine distance threshold (lower = stricter)
 JPEG_QUALITY     = 95           # re-encode quality (80 introduced visible artefacts
                                  # that degrade recognition; 95 is near-lossless)
@@ -165,6 +165,28 @@ def _match_face(embedding: np.ndarray, embeddings: list) -> tuple:
     return best_name, best_distance, best_match_found
 
 
+# ── persistence tracker helpers ──────────────────────────────────────────────
+
+def _iou(a, b) -> float:
+    """
+    Intersection-over-Union between two bounding boxes [x1,y1,x2,y2].
+    Used to match a current detection to a previously seen face slot.
+    """
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+    ix1 = max(ax1, bx1); iy1 = max(ay1, by1)
+    ix2 = min(ax2, bx2); iy2 = min(ay2, by2)
+    inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+    if inter == 0:
+        return 0.0
+    area_a = (ax2 - ax1) * (ay2 - ay1)
+    area_b = (bx2 - bx1) * (by2 - by1)
+    return inter / (area_a + area_b - inter)
+
+# IoU threshold for considering two boxes the "same" face across frames
+_IOU_THRESH = 0.35
+
+
 # ── consumer ──────────────────────────────────────────────────────────────────
 
 class RTSPProxyConsumer(WebsocketConsumer):
@@ -213,6 +235,14 @@ class RTSPProxyConsumer(WebsocketConsumer):
         self._recog_lock     = threading.Lock()
         self._last_recog_ts  = 0.0
         self._recog_interval = 1.0 / RECOG_FPS
+
+        # Persistence tracker.
+        # Maps a slot index → {"bbox": ..., "name": ..., "dist": ..., "matched": bool}
+        # Once a face slot becomes matched (green), it stays green until that
+        # face is no longer detected (IoU with any current detection drops to 0).
+        self._persist        = {}       # {slot_id: dict}
+        self._persist_lock   = threading.Lock()
+        self._persist_slot   = 0        # ever-incrementing slot id counter
 
         # FPS tracking
         self._fps_counter = 0
@@ -268,17 +298,78 @@ class RTSPProxyConsumer(WebsocketConsumer):
                 break                          # sentinel — shut down cleanly
 
             try:
-                embeddings = _get_embeddings()
-                faces   = app.get(frame)
-                results = []
+                embeddings   = _get_embeddings()
+                faces        = app.get(frame)
+                current_bboxes = [face.bbox for face in faces]
 
+                # ── Step 1: Expire slots whose face is no longer detected ──────
+                # A slot is expired when no current detection overlaps it
+                # above IOU_THRESH — meaning that face left the frame.
+                with self._persist_lock:
+                    expired = [
+                        sid for sid, slot in self._persist.items()
+                        if not any(
+                            _iou(slot["bbox"], bbox) >= _IOU_THRESH
+                            for bbox in current_bboxes
+                        )
+                    ]
+                    for sid in expired:
+                        del self._persist[sid]
+
+                # ── Step 2: Run recognition on each detected face ─────────────
+                results = []
                 for face in faces:
+                    bbox            = face.bbox
                     emb             = face.embedding.astype(np.float32)
                     name, dist, matched = _match_face(emb, embeddings)
-                    results.append((face.bbox, name, dist, matched))
 
-                # Sort results so the largest (most prominent) face is drawn last
-                # — mirrors Recognize viewset's max() by bbox area selection
+                    with self._persist_lock:
+                        # Find the existing slot for this face (by IoU overlap)
+                        matched_slot = None
+                        for sid, slot in self._persist.items():
+                            if _iou(slot["bbox"], bbox) >= _IOU_THRESH:
+                                matched_slot = sid
+                                break
+
+                        if matched_slot is not None:
+                            slot = self._persist[matched_slot]
+                            # Always update bbox to follow the face as it moves
+                            slot["bbox"] = bbox
+                            # Only upgrade: red → green (never downgrade green → red)
+                            if matched and not slot["matched"]:
+                                slot["name"]    = name
+                                slot["dist"]    = dist
+                                slot["matched"] = True
+                            elif slot["matched"]:
+                                # Already green — keep the confirmed identity,
+                                # update distance if we get a better read
+                                if matched and dist < slot["dist"]:
+                                    slot["name"] = name
+                                    slot["dist"] = dist
+                        else:
+                            # New face — create a fresh slot
+                            sid = self._persist_slot
+                            self._persist_slot += 1
+                            self._persist[sid] = {
+                                "bbox":    bbox,
+                                "name":    name,
+                                "dist":    dist,
+                                "matched": matched,
+                            }
+
+                    # Use the persisted state for drawing
+                    with self._persist_lock:
+                        for slot in self._persist.values():
+                            if _iou(slot["bbox"], bbox) >= _IOU_THRESH:
+                                results.append((
+                                    bbox,
+                                    slot["name"],
+                                    slot["dist"],
+                                    slot["matched"],
+                                ))
+                                break
+
+                # Sort so largest face is drawn last (on top)
                 results.sort(
                     key=lambda r: (r[0][2] - r[0][0]) * (r[0][3] - r[0][1])
                 )

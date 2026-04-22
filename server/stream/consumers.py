@@ -27,12 +27,16 @@ import subprocess
 import threading
 import time
 import sys
+import io
+import tempfile
+import os
 
 import cv2
 import numpy as np
 from scipy.spatial.distance import cosine
 from channels.generic.websocket import WebsocketConsumer
 import django.db
+import whisper
 
 from .models import FaceMap
 
@@ -49,6 +53,15 @@ JPEG_QUALITY     = 95           # re-encode quality (80 introduced visible artef
 # InsightFace detection input size — larger = better accuracy on distant/small faces.
 # 640x640 is the default; 1280x1280 is slower but noticeably better at range.
 DET_SIZE         = (640, 640)
+
+# ── audio / transcription config ──────────────────────────────────────────────
+AUDIO_SAMPLE_RATE = 16000       # Hz — Whisper expects 16 kHz mono PCM
+AUDIO_CHUNK_SEC   = 4           # seconds of audio per Whisper inference call
+                                 # shorter = lower latency, higher CPU cost
+                                 # longer = more context, better accuracy
+WHISPER_MODEL     = "base"      # tiny | base | small | medium | large
+                                 # base is the best latency/accuracy tradeoff
+                                 # for real-time on CPU
 
 # Retry delays in seconds (mirrors the Node.js RETRY_DELAYS_MS array)
 RETRY_DELAYS = [3, 6, 12, 24, 48]
@@ -73,6 +86,23 @@ def _get_face_app():
                 app.prepare(ctx_id=0, det_size=DET_SIZE)
                 _face_app = app
     return _face_app
+
+
+# ── module-level Whisper singleton ───────────────────────────────────────────
+_whisper_model      = None
+_whisper_model_lock = threading.Lock()
+
+
+def _get_whisper():
+    """Return the shared Whisper model instance (loaded once, used by all connections)."""
+    global _whisper_model
+    if _whisper_model is None:
+        with _whisper_model_lock:
+            if _whisper_model is None:
+                print(f"[whisper] Loading model '{WHISPER_MODEL}'…")
+                _whisper_model = whisper.load_model(WHISPER_MODEL)
+                print("[whisper] Model ready.")
+    return _whisper_model
 
 
 # ── module-level embedding cache (shared across all connections) ───────────────
@@ -244,6 +274,17 @@ class RTSPProxyConsumer(WebsocketConsumer):
         self._persist_lock   = threading.Lock()
         self._persist_slot   = 0        # ever-incrementing slot id counter
 
+        # Audio transcription state
+        # A second ffmpeg process pulls raw PCM audio from the same RTSP URL.
+        # The chunker thread accumulates samples and fires Whisper every
+        # AUDIO_CHUNK_SEC seconds via a queue, exactly mirroring the
+        # recognition worker pattern.
+        self._audio_proc     = None     # ffmpeg audio process
+        self._audio_queue    = queue.Queue(maxsize=4)
+        self._pcm_buf        = bytearray()
+        self._pcm_lock       = threading.Lock()
+        self._bytes_per_chunk = AUDIO_SAMPLE_RATE * AUDIO_CHUNK_SEC * 2  # 16-bit mono
+
         # FPS tracking
         self._fps_counter = 0
         self._fps_display = 0.0
@@ -253,8 +294,13 @@ class RTSPProxyConsumer(WebsocketConsumer):
         # Start recognition worker before ffmpeg so it's ready immediately
         threading.Thread(target=self._recognition_worker, daemon=True).start()
 
+        # Start Whisper worker — loads model in background so first chunk
+        # doesn't block the video pipeline
+        threading.Thread(target=self._whisper_worker, daemon=True).start()
+
         print(f"[rtsp-proxy] Client connected → {rtsp_url}")
         self._launch_ffmpeg()
+        self._launch_audio_ffmpeg()
 
     def disconnect(self, code):
         self._closed = True
@@ -277,6 +323,21 @@ class RTSPProxyConsumer(WebsocketConsumer):
         # Send sentinel to unblock recognition worker so its thread exits
         try:
             self._recog_queue.put_nowait(None)
+        except Exception:
+            pass
+
+        # Kill audio ffmpeg process
+        audio_proc = self._audio_proc
+        if audio_proc is not None:
+            try:
+                audio_proc.kill()
+            except OSError:
+                pass
+            self._audio_proc = None
+
+        # Unblock whisper worker
+        try:
+            self._audio_queue.put_nowait(None)
         except Exception:
             pass
 
@@ -436,7 +497,7 @@ class RTSPProxyConsumer(WebsocketConsumer):
                 self._fps_ts      = now
             fps = self._fps_display
 
-        _draw_fps(frame, fps)
+        # _draw_fps(frame, fps)
 
         # Re-encode and send
         ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
@@ -583,6 +644,133 @@ class RTSPProxyConsumer(WebsocketConsumer):
             self._buf.clear()
         self._launch_ffmpeg()
 
+    # ── audio capture + transcription ────────────────────────────────────────
+
+    def _launch_audio_ffmpeg(self):
+        """
+        Spawn a second ffmpeg process that pulls ONLY audio from the RTSP
+        stream and pipes raw 16-bit mono PCM at 16 kHz to stdout.
+        Runs completely independently of the video ffmpeg process.
+        """
+        if self._closed:
+            return
+
+        cmd = [
+            "ffmpeg",
+            "-loglevel",       "error",
+            "-rtsp_transport", "tcp",
+            "-i",              self._rtsp_url,
+            "-vn",                          # no video
+            "-acodec",         "pcm_s16le", # raw 16-bit signed little-endian PCM
+            "-ar",             str(AUDIO_SAMPLE_RATE),
+            "-ac",             "1",         # mono
+            "-f",              "s16le",     # raw PCM container
+            "pipe:1",
+        ]
+
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,  # suppress audio ffmpeg noise
+                bufsize=0,
+            )
+        except (FileNotFoundError, OSError) as exc:
+            print(f"[audio] ffmpeg spawn failed: {exc}")
+            return
+
+        self._audio_proc = proc
+        print("[audio] ffmpeg started — capturing audio stream")
+
+        threading.Thread(
+            target=self._read_audio_stdout,
+            args=(proc,),
+            daemon=True,
+        ).start()
+
+    def _read_audio_stdout(self, proc: subprocess.Popen):
+        """
+        Read raw PCM bytes from audio ffmpeg stdout.
+        Accumulates samples in _pcm_buf and enqueues a chunk to the
+        Whisper worker every AUDIO_CHUNK_SEC seconds.
+        """
+        CHUNK = 4096
+        try:
+            while not self._closed:
+                chunk = proc.stdout.read(CHUNK)
+                if not chunk:
+                    break
+
+                with self._pcm_lock:
+                    self._pcm_buf.extend(chunk)
+
+                    # When we have enough samples for one Whisper inference,
+                    # cut a chunk and hand it off — keep any leftover bytes
+                    while len(self._pcm_buf) >= self._bytes_per_chunk:
+                        pcm_chunk = bytes(self._pcm_buf[:self._bytes_per_chunk])
+                        del self._pcm_buf[:self._bytes_per_chunk]
+                        try:
+                            self._audio_queue.put_nowait(pcm_chunk)
+                        except queue.Full:
+                            # Whisper is falling behind — drop oldest chunk
+                            try:
+                                self._audio_queue.get_nowait()
+                            except queue.Empty:
+                                pass
+                            self._audio_queue.put_nowait(pcm_chunk)
+
+        except OSError:
+            pass
+
+    def _whisper_worker(self):
+        """
+        Pull PCM chunks from _audio_queue, run Whisper transcription,
+        and send transcript text frames to the browser.
+        Runs in its own daemon thread — never blocks the video pipeline.
+        """
+        model = _get_whisper()
+
+        while True:
+            pcm_chunk = self._audio_queue.get()
+            if pcm_chunk is None:
+                break   # sentinel — shut down
+
+            try:
+                # Convert raw PCM bytes → float32 numpy array in [-1, 1]
+                # that Whisper expects
+                audio = np.frombuffer(pcm_chunk, dtype=np.int16).astype(np.float32)
+                audio /= 32768.0  # normalise to [-1.0, 1.0]
+
+                rms = np.abs(audio).mean()
+                print(f"[whisper] chunk received — rms={rms:.5f}")
+
+                # Skip near-silent chunks — threshold lowered to 0.0001 so
+                # even quiet camera audio passes through.
+                # Raise if Whisper hallucinates too much on silence.
+                if rms < 0.0001:
+                    print("[whisper] SKIPPED — below silence threshold")
+                    continue
+
+                print("[whisper] Running transcription…")
+                result = model.transcribe(
+                    audio,
+                    fp16=False,             # CPU-safe
+                    language=None,          # auto-detect
+                    condition_on_previous_text=True,
+                    no_speech_threshold=0.4,   # Whisper's own silence gate
+                    logprob_threshold=-1.0,    # accept lower-confidence segments
+                )
+                text = result.get("text", "").strip()
+                print(f"[whisper] result: '{text}'")
+
+                if text:
+                    self._send_transcript(text)
+
+            except Exception as exc:
+                import traceback
+                print(f"[whisper] Error: {exc}")
+                traceback.print_exc()
+
     # ── thread-safe WebSocket send helpers ────────────────────────────────────
 
     def _send_bytes(self, data: bytes):
@@ -596,5 +784,12 @@ class RTSPProxyConsumer(WebsocketConsumer):
         """Send a JSON status/control text frame."""
         try:
             self.send(text_data=json.dumps({"type": "status", "msg": msg}))
+        except Exception:
+            pass
+
+    def _send_transcript(self, text: str):
+        """Send a Whisper transcript as a JSON text frame."""
+        try:
+            self.send(text_data=json.dumps({"type": "transcript", "text": text}))
         except Exception:
             pass
