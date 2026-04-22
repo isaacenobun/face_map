@@ -42,6 +42,8 @@ import tempfile
 from io import BytesIO
 from elevenlabs.client import ElevenLabs
 
+from elevenlabs.core.api_error import ApiError
+
 from .models import FaceMap
 
 # ── stream / recognition config ───────────────────────────────────────────────
@@ -60,7 +62,7 @@ DET_SIZE         = (640, 640)
 
 # ── audio / transcription config ──────────────────────────────────────────────
 AUDIO_SAMPLE_RATE = 16000       # Hz — Elevenlabs expects 16 kHz mono PCM
-AUDIO_CHUNK_SEC   = 10           # seconds of audio per Elevenlabs inference call
+AUDIO_CHUNK_SEC   = 30           # seconds of audio per Elevenlabs inference call
                                  # shorter = lower latency, higher CPU cost
                                  # longer = more context, better accuracy
 
@@ -259,6 +261,7 @@ class RTSPProxyConsumer(WebsocketConsumer):
         self._attempt     = 0
         self._active_proc = None
         self._retry_timer = None
+        self._eleven_disabled_until = 0
 
         # Frame buffer for ffmpeg stdout parsing
         self._buf      = bytearray()
@@ -790,6 +793,9 @@ class RTSPProxyConsumer(WebsocketConsumer):
         client = _get_eleven()
 
         while True:
+            if time.time() < self._eleven_disabled_until:
+                time.sleep(2)
+                continue
             pcm_chunk = self._audio_queue.get()
 
             if pcm_chunk is None:
@@ -860,6 +866,32 @@ class RTSPProxyConsumer(WebsocketConsumer):
 
                 if text:
                     self._send_transcript(text)
+
+
+            except ApiError as exc:
+
+                status = getattr(exc, "status_code", None)
+
+                # Free-tier abuse lock or auth failure
+                if status == 401:
+
+                    print(
+                        "[eleven] 401 unusual activity detected. "
+                        "Pausing transcription for 30 minutes."
+                    )
+
+                    # circuit breaker
+                    self._eleven_disabled_until = time.time() + (30 * 60)
+
+                    continue
+
+                # Rate limiting
+                if status == 429:
+                    print("[eleven] Rate limited. Backing off 60s")
+                    time.sleep(60)
+                    continue
+
+                print(f"[eleven] API error: {exc}")
 
 
             except Exception as exc:
