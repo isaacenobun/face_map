@@ -274,6 +274,11 @@ class RTSPProxyConsumer(WebsocketConsumer):
         self._persist_lock   = threading.Lock()
         self._persist_slot   = 0        # ever-incrementing slot id counter
 
+        # Names already announced during this websocket session.
+        # Prevents duplicate recognition events even if a person leaves
+        # frame and re-enters later.
+        self._recognized_names = set()
+
         # Audio transcription state
         # A second ffmpeg process pulls raw PCM audio from the same RTSP URL.
         # The chunker thread accumulates samples and fires Whisper every
@@ -401,6 +406,26 @@ class RTSPProxyConsumer(WebsocketConsumer):
                                 slot["name"]    = name
                                 slot["dist"]    = dist
                                 slot["matched"] = True
+
+                                # SESSION-level first recognition only
+                                if name != "Unknown" and name not in self._recognized_names:
+                                    ts = time.time()
+                                    iso = (
+                                        time.strftime(
+                                            "%Y-%m-%dT%H:%M:%S",
+                                            time.gmtime(ts)
+                                        )
+                                        + f".{int((ts % 1)*1000):03d}Z"
+                                    )
+
+                                    slot["recognized_at"] = iso
+                                    self._recognized_names.add(name)
+
+                                    self._send_recognition(
+                                        name=name,
+                                        recognized_at=iso,
+                                        distance=dist,
+                                    )
                             elif slot["matched"]:
                                 # Already green — keep the confirmed identity,
                                 # update distance if we get a better read
@@ -412,11 +437,33 @@ class RTSPProxyConsumer(WebsocketConsumer):
                             sid = self._persist_slot
                             self._persist_slot += 1
                             self._persist[sid] = {
-                                "bbox":    bbox,
-                                "name":    name,
-                                "dist":    dist,
-                                "matched": matched,
+                                "bbox":          bbox,
+                                "name":          name,
+                                "dist":          dist,
+                                "matched":       matched,
+                                "recognized_at": None,
                             }
+                        
+                        # If a brand-new face is already matched on first sight,
+                        # emit session-level first recognition event.
+                        if matched and name != "Unknown" and name not in self._recognized_names:
+                            ts = time.time()
+                            iso = (
+                                time.strftime(
+                                    "%Y-%m-%dT%H:%M:%S",
+                                    time.gmtime(ts)
+                                )
+                                + f".{int((ts % 1)*1000):03d}Z"
+                            )
+
+                            self._persist[sid]["recognized_at"] = iso
+                            self._recognized_names.add(name)
+
+                            self._send_recognition(
+                                name=name,
+                                recognized_at=iso,
+                                distance=dist,
+                            )
 
                     # Use the persisted state for drawing
                     with self._persist_lock:
@@ -791,5 +838,22 @@ class RTSPProxyConsumer(WebsocketConsumer):
         """Send a Whisper transcript as a JSON text frame."""
         try:
             self.send(text_data=json.dumps({"type": "transcript", "text": text}))
+        except Exception:
+            pass
+
+    def _send_recognition(self, name: str, recognized_at: str, distance: float):
+        """
+        Send first-ever recognition event for this websocket session.
+        One event per unique person name.
+        """
+        try:
+            self.send(
+                text_data=json.dumps({
+                    "type": "recognition",
+                    "name": name,
+                    "recognized_at": recognized_at,
+                    "distance": round(float(distance), 4),
+                })
+            )
         except Exception:
             pass
