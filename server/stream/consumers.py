@@ -62,7 +62,7 @@ DET_SIZE         = (640, 640)
 
 # ── audio / transcription config ──────────────────────────────────────────────
 AUDIO_SAMPLE_RATE = 16000       # Hz — Elevenlabs expects 16 kHz mono PCM
-AUDIO_CHUNK_SEC   = 30           # seconds of audio per Elevenlabs inference call
+AUDIO_CHUNK_SEC   = 20           # seconds of audio per Elevenlabs inference call
                                  # shorter = lower latency, higher CPU cost
                                  # longer = more context, better accuracy
 
