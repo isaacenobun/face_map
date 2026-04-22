@@ -36,7 +36,11 @@ import numpy as np
 from scipy.spatial.distance import cosine
 from channels.generic.websocket import WebsocketConsumer
 import django.db
-import whisper
+
+import os
+import tempfile
+from io import BytesIO
+from elevenlabs.client import ElevenLabs
 
 from .models import FaceMap
 
@@ -55,13 +59,13 @@ JPEG_QUALITY     = 95           # re-encode quality (80 introduced visible artef
 DET_SIZE         = (640, 640)
 
 # ── audio / transcription config ──────────────────────────────────────────────
-AUDIO_SAMPLE_RATE = 16000       # Hz — Whisper expects 16 kHz mono PCM
-AUDIO_CHUNK_SEC   = 4           # seconds of audio per Whisper inference call
+AUDIO_SAMPLE_RATE = 16000       # Hz — Elevenlabs expects 16 kHz mono PCM
+AUDIO_CHUNK_SEC   = 10           # seconds of audio per Elevenlabs inference call
                                  # shorter = lower latency, higher CPU cost
                                  # longer = more context, better accuracy
-WHISPER_MODEL     = "base"      # tiny | base | small | medium | large
-                                 # base is the best latency/accuracy tradeoff
-                                 # for real-time on CPU
+
+ELEVEN_MODEL = "scribe_v2"
+ELEVEN_LANGUAGE = "eng"   # or None for auto-detect
 
 # Retry delays in seconds (mirrors the Node.js RETRY_DELAYS_MS array)
 RETRY_DELAYS = [3, 6, 12, 24, 48]
@@ -88,21 +92,26 @@ def _get_face_app():
     return _face_app
 
 
-# ── module-level Whisper singleton ───────────────────────────────────────────
-_whisper_model      = None
-_whisper_model_lock = threading.Lock()
+_eleven_client = None
+_eleven_lock = threading.Lock()
 
 
-def _get_whisper():
-    """Return the shared Whisper model instance (loaded once, used by all connections)."""
-    global _whisper_model
-    if _whisper_model is None:
-        with _whisper_model_lock:
-            if _whisper_model is None:
-                print(f"[whisper] Loading model '{WHISPER_MODEL}'…")
-                _whisper_model = whisper.load_model(WHISPER_MODEL)
-                print("[whisper] Model ready.")
-    return _whisper_model
+def _get_eleven():
+    """
+    Shared ElevenLabs client singleton.
+    """
+    global _eleven_client
+
+    if _eleven_client is None:
+        with _eleven_lock:
+            if _eleven_client is None:
+                print("[eleven] Initializing client...")
+                _eleven_client = ElevenLabs(
+                    api_key=os.getenv("ELEVENLABS_API_KEY"),
+                )
+                print("[eleven] Client ready.")
+
+    return _eleven_client
 
 
 # ── module-level embedding cache (shared across all connections) ───────────────
@@ -281,7 +290,7 @@ class RTSPProxyConsumer(WebsocketConsumer):
 
         # Audio transcription state
         # A second ffmpeg process pulls raw PCM audio from the same RTSP URL.
-        # The chunker thread accumulates samples and fires Whisper every
+        # The chunker thread accumulates samples and fires Elevenlabs every
         # AUDIO_CHUNK_SEC seconds via a queue, exactly mirroring the
         # recognition worker pattern.
         self._audio_proc     = None     # ffmpeg audio process
@@ -299,9 +308,12 @@ class RTSPProxyConsumer(WebsocketConsumer):
         # Start recognition worker before ffmpeg so it's ready immediately
         threading.Thread(target=self._recognition_worker, daemon=True).start()
 
-        # Start Whisper worker — loads model in background so first chunk
+        # Start ElevenLabs worker — initializes client in background so first chunk
         # doesn't block the video pipeline
-        threading.Thread(target=self._whisper_worker, daemon=True).start()
+        threading.Thread(
+            target=self._eleven_worker,
+            daemon=True
+        ).start()
 
         print(f"[rtsp-proxy] Client connected → {rtsp_url}")
         self._launch_ffmpeg()
@@ -340,7 +352,7 @@ class RTSPProxyConsumer(WebsocketConsumer):
                 pass
             self._audio_proc = None
 
-        # Unblock whisper worker
+        # Unblock Elevenlabs worker
         try:
             self._audio_queue.put_nowait(None)
         except Exception:
@@ -739,7 +751,7 @@ class RTSPProxyConsumer(WebsocketConsumer):
         """
         Read raw PCM bytes from audio ffmpeg stdout.
         Accumulates samples in _pcm_buf and enqueues a chunk to the
-        Whisper worker every AUDIO_CHUNK_SEC seconds.
+        Elevenlabs worker every AUDIO_CHUNK_SEC seconds.
         """
         CHUNK = 4096
         try:
@@ -751,7 +763,7 @@ class RTSPProxyConsumer(WebsocketConsumer):
                 with self._pcm_lock:
                     self._pcm_buf.extend(chunk)
 
-                    # When we have enough samples for one Whisper inference,
+                    # When we have enough samples for one Elevenlabs inference,
                     # cut a chunk and hand it off — keep any leftover bytes
                     while len(self._pcm_buf) >= self._bytes_per_chunk:
                         pcm_chunk = bytes(self._pcm_buf[:self._bytes_per_chunk])
@@ -759,7 +771,7 @@ class RTSPProxyConsumer(WebsocketConsumer):
                         try:
                             self._audio_queue.put_nowait(pcm_chunk)
                         except queue.Full:
-                            # Whisper is falling behind — drop oldest chunk
+                            # Elevenlabs is falling behind — drop oldest chunk
                             try:
                                 self._audio_queue.get_nowait()
                             except queue.Empty:
@@ -769,53 +781,90 @@ class RTSPProxyConsumer(WebsocketConsumer):
         except OSError:
             pass
 
-    def _whisper_worker(self):
+    def _eleven_worker(self):
         """
-        Pull PCM chunks from _audio_queue, run Whisper transcription,
-        and send transcript text frames to the browser.
-        Runs in its own daemon thread — never blocks the video pipeline.
+        Pull PCM chunks from queue and transcribe
+        using ElevenLabs Scribe.
         """
-        model = _get_whisper()
+
+        client = _get_eleven()
 
         while True:
             pcm_chunk = self._audio_queue.get()
+
             if pcm_chunk is None:
-                break   # sentinel — shut down
+                break
 
             try:
-                # Convert raw PCM bytes → float32 numpy array in [-1, 1]
-                # that Whisper expects
-                audio = np.frombuffer(pcm_chunk, dtype=np.int16).astype(np.float32)
-                audio /= 32768.0  # normalise to [-1.0, 1.0]
+                # Silence gate (keep your original protection)
+                audio = np.frombuffer(
+                    pcm_chunk,
+                    dtype=np.int16
+                ).astype(np.float32)
+
+                audio /= 32768.0
 
                 rms = np.abs(audio).mean()
-                print(f"[whisper] chunk received — rms={rms:.5f}")
 
-                # Skip near-silent chunks — threshold lowered to 0.0001 so
-                # even quiet camera audio passes through.
-                # Raise if Whisper hallucinates too much on silence.
+                print(f"[eleven] chunk rms={rms:.5f}")
+
                 if rms < 0.0001:
-                    print("[whisper] SKIPPED — below silence threshold")
+                    print("[eleven] skipped silence")
                     continue
 
-                print("[whisper] Running transcription…")
-                result = model.transcribe(
-                    audio,
-                    fp16=False,             # CPU-safe
-                    language=None,          # auto-detect
-                    condition_on_previous_text=True,
-                    no_speech_threshold=0.4,   # Whisper's own silence gate
-                    logprob_threshold=-1.0,    # accept lower-confidence segments
-                )
-                text = result.get("text", "").strip()
-                print(f"[whisper] result: '{text}'")
+
+                # ElevenLabs expects a file-like object.
+                # Our ffmpeg audio is raw PCM, so wrap as WAV.
+                with tempfile.NamedTemporaryFile(
+                    suffix=".wav",
+                    delete=False
+                ) as f:
+
+                    import wave
+
+                    with wave.open(f.name, "wb") as wav:
+                        wav.setnchannels(1)
+                        wav.setsampwidth(2)  # 16-bit
+                        wav.setframerate(AUDIO_SAMPLE_RATE)
+                        wav.writeframes(pcm_chunk)
+
+                    temp_path = f.name
+
+
+                with open(temp_path, "rb") as audio_file:
+
+                    result = client.speech_to_text.convert(
+                        file=audio_file,
+                        model_id=ELEVEN_MODEL,
+                        tag_audio_events=True,
+                        language_code=ELEVEN_LANGUAGE,
+                        diarize=True,
+                    )
+
+
+                os.unlink(temp_path)
+
+
+                # SDK object may be typed object or dict
+                text = ""
+
+                if hasattr(result, "text"):
+                    text = result.text.strip()
+
+                elif isinstance(result, dict):
+                    text = result.get("text","").strip()
+
+
+                print(f"[eleven] result: {text}")
+
 
                 if text:
                     self._send_transcript(text)
 
+
             except Exception as exc:
                 import traceback
-                print(f"[whisper] Error: {exc}")
+                print(f"[eleven] Error: {exc}")
                 traceback.print_exc()
 
     # ── thread-safe WebSocket send helpers ────────────────────────────────────
@@ -835,7 +884,7 @@ class RTSPProxyConsumer(WebsocketConsumer):
             pass
 
     def _send_transcript(self, text: str):
-        """Send a Whisper transcript as a JSON text frame."""
+        """Send a Elevenlabs transcript as a JSON text frame."""
         try:
             self.send(text_data=json.dumps({"type": "transcript", "text": text}))
         except Exception:
