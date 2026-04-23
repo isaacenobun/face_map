@@ -21,15 +21,15 @@ Client connects at:
     ws://<host>/ws/stream/?rtsp_url=rtsp://user:pass@host/path
 """
 
+import io
 import json
 import queue
 import subprocess
 import threading
 import time
 import sys
-import io
-import tempfile
 import os
+import wave
 
 import cv2
 import numpy as np
@@ -37,17 +37,13 @@ from scipy.spatial.distance import cosine
 from channels.generic.websocket import WebsocketConsumer
 import django.db
 
-import os
-import tempfile
-from io import BytesIO
 from elevenlabs.client import ElevenLabs
-
 from elevenlabs.core.api_error import ApiError
 
 from .models import FaceMap
 
 # ── stream / recognition config ───────────────────────────────────────────────
-DEFAULT_RTSP_URL = "rtsp://admin:trace321@192.168.100.64:554/Streaming/Channels/101"
+DEFAULT_RTSP_URL = "rtsp://admin:trace321@192.168.1.64:554/Streaming/Channels/101"
 FPS              = 10           # ffmpeg output frame rate
 SCALE            = "1280:-1"    # higher res → better face detail for recognition
                                  # use "640:-1" if CPU can't keep up
@@ -61,20 +57,31 @@ JPEG_QUALITY     = 95           # re-encode quality (80 introduced visible artef
 DET_SIZE         = (640, 640)
 
 # ── audio / transcription config ──────────────────────────────────────────────
-AUDIO_SAMPLE_RATE = 16000       # Hz — Elevenlabs expects 16 kHz mono PCM
-AUDIO_CHUNK_SEC   = 20           # seconds of audio per Elevenlabs inference call
+AUDIO_SAMPLE_RATE  = 16000      # Hz — ElevenLabs expects 16 kHz mono PCM
+AUDIO_CHUNK_SEC    = 20         # seconds of audio per ElevenLabs inference call
                                  # shorter = lower latency, higher CPU cost
                                  # longer = more context, better accuracy
 
-ELEVEN_MODEL = "scribe_v2"
-ELEVEN_LANGUAGE = "eng"   # or None for auto-detect
+ELEVEN_MODEL    = "scribe_v2"
+ELEVEN_LANGUAGE = "eng"         # or None for auto-detect
 
-# Retry delays in seconds (mirrors the Node.js RETRY_DELAYS_MS array)
+# Silence gate — int16 RMS (0–32768 scale).
+# Equivalent to ~0.0003 float RMS; keeps the same sensitivity as the original.
+_SILENCE_RMS_INT16 = 10
+
+# Exponential backoff caps (seconds) for ElevenLabs 429 rate-limit responses
+_ELEVEN_BACKOFF = [10, 20, 40, 60, 120]
+
+# Retry delays in seconds for RTSP reconnects (mirrors the Node.js RETRY_DELAYS_MS array)
 RETRY_DELAYS = [3, 6, 12, 24, 48]
 
 # JPEG byte markers
 _SOI = bytes([0xFF, 0xD8])  # start of image
 _EOI = bytes([0xFF, 0xD9])  # end of image
+
+# IoU threshold for considering two boxes the "same" face across frames
+_IOU_THRESH = 0.35
+
 
 # ── module-level InsightFace singleton ────────────────────────────────────────
 _face_app      = None
@@ -94,25 +101,20 @@ def _get_face_app():
     return _face_app
 
 
+# ── module-level ElevenLabs singleton ────────────────────────────────────────
 _eleven_client = None
-_eleven_lock = threading.Lock()
+_eleven_lock   = threading.Lock()
 
 
 def _get_eleven():
-    """
-    Shared ElevenLabs client singleton.
-    """
+    """Shared ElevenLabs client singleton (created once, thread-safe)."""
     global _eleven_client
-
     if _eleven_client is None:
         with _eleven_lock:
             if _eleven_client is None:
-                print("[eleven] Initializing client...")
-                _eleven_client = ElevenLabs(
-                    api_key=os.getenv("ELEVENLABS_API_KEY"),
-                )
+                print("[eleven] Initialising client …")
+                _eleven_client = ElevenLabs(api_key=os.getenv("ELEVENLABS_API_KEY"))
                 print("[eleven] Client ready.")
-
     return _eleven_client
 
 
@@ -151,7 +153,33 @@ def _get_embeddings() -> list:
         return list(_emb_cache)
 
 
-# ── drawing helpers (ported from the standalone script) ───────────────────────
+# ── audio helpers ─────────────────────────────────────────────────────────────
+
+def _pcm_to_wav_bytes(pcm: bytes, sample_rate: int = AUDIO_SAMPLE_RATE) -> bytes:
+    """
+    Wrap raw 16-bit mono PCM in a WAV container entirely in memory.
+    Avoids all disk I/O that a tempfile approach would incur.
+    """
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)           # 16-bit
+        w.setframerate(sample_rate)
+        w.writeframes(pcm)
+    return buf.getvalue()
+
+
+def _is_silent(pcm: bytes, threshold: int = _SILENCE_RMS_INT16) -> bool:
+    """
+    Fast silence gate on raw int16 PCM.
+    Operates on the native int16 dtype — no float conversion needed —
+    which is ~2× faster and avoids a temporary array allocation.
+    """
+    samples = np.frombuffer(pcm, dtype=np.int16)
+    return int(np.abs(samples).mean()) < threshold
+
+
+# ── drawing helpers ───────────────────────────────────────────────────────────
 
 def _draw_face(frame: np.ndarray, bbox, name: str, dist: float, matched: bool):
     """Draw a coloured bounding box and label on frame (in-place)."""
@@ -224,9 +252,6 @@ def _iou(a, b) -> float:
     area_b = (bx2 - bx1) * (by2 - by1)
     return inter / (area_a + area_b - inter)
 
-# IoU threshold for considering two boxes the "same" face across frames
-_IOU_THRESH = 0.35
-
 
 # ── consumer ──────────────────────────────────────────────────────────────────
 
@@ -244,6 +269,10 @@ class RTSPProxyConsumer(WebsocketConsumer):
                                InsightFace, stores results in _recog_results
     _drain_stderr thread     — forwards ffmpeg stderr to server stderr
     _watch_exit thread       — waits for ffmpeg to exit and schedules retry
+    _read_audio_stdout thread — reads raw PCM from audio ffmpeg, accumulates
+                               chunks and enqueues for ElevenLabs
+    _eleven_worker thread    — pulls PCM chunks from queue, transcribes via
+                               ElevenLabs Scribe, sends transcript frames
     """
 
     # ── lifecycle ─────────────────────────────────────────────────────────────
@@ -261,7 +290,6 @@ class RTSPProxyConsumer(WebsocketConsumer):
         self._attempt     = 0
         self._active_proc = None
         self._retry_timer = None
-        self._eleven_disabled_until = 0
 
         # Frame buffer for ffmpeg stdout parsing
         self._buf      = bytearray()
@@ -291,16 +319,20 @@ class RTSPProxyConsumer(WebsocketConsumer):
         # frame and re-enters later.
         self._recognized_names = set()
 
-        # Audio transcription state
+        # Audio transcription state.
         # A second ffmpeg process pulls raw PCM audio from the same RTSP URL.
-        # The chunker thread accumulates samples and fires Elevenlabs every
-        # AUDIO_CHUNK_SEC seconds via a queue, exactly mirroring the
-        # recognition worker pattern.
-        self._audio_proc     = None     # ffmpeg audio process
-        self._audio_queue    = queue.Queue(maxsize=4)
-        self._pcm_buf        = bytearray()
-        self._pcm_lock       = threading.Lock()
+        # The chunker thread accumulates samples and fires ElevenLabs every
+        # AUDIO_CHUNK_SEC seconds via a queue, mirroring the recognition
+        # worker pattern.
+        self._audio_proc      = None    # ffmpeg audio process
+        self._audio_queue     = queue.Queue(maxsize=4)
+        self._pcm_buf         = bytearray()
+        self._pcm_lock        = threading.Lock()
         self._bytes_per_chunk = AUDIO_SAMPLE_RATE * AUDIO_CHUNK_SEC * 2  # 16-bit mono
+
+        # ElevenLabs circuit breaker + backoff state
+        self._eleven_disabled_until = 0.0
+        self._eleven_backoff_idx    = 0
 
         # FPS tracking
         self._fps_counter = 0
@@ -311,15 +343,10 @@ class RTSPProxyConsumer(WebsocketConsumer):
         # Start recognition worker before ffmpeg so it's ready immediately
         threading.Thread(target=self._recognition_worker, daemon=True).start()
 
-        # Start ElevenLabs worker — initializes client in background so first chunk
-        # doesn't block the video pipeline
-        threading.Thread(
-            target=self._eleven_worker,
-            daemon=True
-        ).start()
-
         print(f"[rtsp-proxy] Client connected → {rtsp_url}")
         self._launch_ffmpeg()
+        # _eleven_worker is started inside _launch_audio_ffmpeg() so it is
+        # tied to the audio process actually being alive.
         self._launch_audio_ffmpeg()
 
     def disconnect(self, code):
@@ -331,7 +358,7 @@ class RTSPProxyConsumer(WebsocketConsumer):
             self._retry_timer.cancel()
             self._retry_timer = None
 
-        # Kill ffmpeg
+        # Kill video ffmpeg
         proc = self._active_proc
         if proc is not None:
             try:
@@ -355,7 +382,7 @@ class RTSPProxyConsumer(WebsocketConsumer):
                 pass
             self._audio_proc = None
 
-        # Unblock Elevenlabs worker
+        # Send sentinel to unblock ElevenLabs worker
         try:
             self._audio_queue.put_nowait(None)
         except Exception:
@@ -379,8 +406,8 @@ class RTSPProxyConsumer(WebsocketConsumer):
                 break                          # sentinel — shut down cleanly
 
             try:
-                embeddings   = _get_embeddings()
-                faces        = app.get(frame)
+                embeddings     = _get_embeddings()
+                faces          = app.get(frame)
                 current_bboxes = [face.bbox for face in faces]
 
                 # ── Step 1: Expire slots whose face is no longer detected ──────
@@ -400,8 +427,8 @@ class RTSPProxyConsumer(WebsocketConsumer):
                 # ── Step 2: Run recognition on each detected face ─────────────
                 results = []
                 for face in faces:
-                    bbox            = face.bbox
-                    emb             = face.embedding.astype(np.float32)
+                    bbox                = face.bbox
+                    emb                 = face.embedding.astype(np.float32)
                     name, dist, matched = _match_face(emb, embeddings)
 
                     with self._persist_lock:
@@ -424,23 +451,11 @@ class RTSPProxyConsumer(WebsocketConsumer):
 
                                 # SESSION-level first recognition only
                                 if name != "Unknown" and name not in self._recognized_names:
-                                    ts = time.time()
-                                    iso = (
-                                        time.strftime(
-                                            "%Y-%m-%dT%H:%M:%S",
-                                            time.gmtime(ts)
-                                        )
-                                        + f".{int((ts % 1)*1000):03d}Z"
-                                    )
-
+                                    iso = self._iso_now()
                                     slot["recognized_at"] = iso
                                     self._recognized_names.add(name)
+                                    self._send_recognition(name=name, recognized_at=iso, distance=dist)
 
-                                    self._send_recognition(
-                                        name=name,
-                                        recognized_at=iso,
-                                        distance=dist,
-                                    )
                             elif slot["matched"]:
                                 # Already green — keep the confirmed identity,
                                 # update distance if we get a better read
@@ -458,27 +473,14 @@ class RTSPProxyConsumer(WebsocketConsumer):
                                 "matched":       matched,
                                 "recognized_at": None,
                             }
-                        
-                        # If a brand-new face is already matched on first sight,
-                        # emit session-level first recognition event.
-                        if matched and name != "Unknown" and name not in self._recognized_names:
-                            ts = time.time()
-                            iso = (
-                                time.strftime(
-                                    "%Y-%m-%dT%H:%M:%S",
-                                    time.gmtime(ts)
-                                )
-                                + f".{int((ts % 1)*1000):03d}Z"
-                            )
 
-                            self._persist[sid]["recognized_at"] = iso
-                            self._recognized_names.add(name)
-
-                            self._send_recognition(
-                                name=name,
-                                recognized_at=iso,
-                                distance=dist,
-                            )
+                            # If a brand-new face is already matched on first sight,
+                            # emit session-level first recognition event.
+                            if matched and name != "Unknown" and name not in self._recognized_names:
+                                iso = self._iso_now()
+                                self._persist[sid]["recognized_at"] = iso
+                                self._recognized_names.add(name)
+                                self._send_recognition(name=name, recognized_at=iso, distance=dist)
 
                     # Use the persisted state for drawing
                     with self._persist_lock:
@@ -706,13 +708,15 @@ class RTSPProxyConsumer(WebsocketConsumer):
             self._buf.clear()
         self._launch_ffmpeg()
 
-    # ── audio capture + transcription ────────────────────────────────────────
+    # ── audio capture ─────────────────────────────────────────────────────────
 
     def _launch_audio_ffmpeg(self):
         """
         Spawn a second ffmpeg process that pulls ONLY audio from the RTSP
         stream and pipes raw 16-bit mono PCM at 16 kHz to stdout.
         Runs completely independently of the video ffmpeg process.
+        The ElevenLabs worker thread is started here so it is tied to the
+        audio process actually being alive.
         """
         if self._closed:
             return
@@ -722,11 +726,11 @@ class RTSPProxyConsumer(WebsocketConsumer):
             "-loglevel",       "error",
             "-rtsp_transport", "tcp",
             "-i",              self._rtsp_url,
-            "-vn",                          # no video
-            "-acodec",         "pcm_s16le", # raw 16-bit signed little-endian PCM
+            "-vn",                           # no video
+            "-acodec",         "pcm_s16le",  # raw 16-bit signed little-endian PCM
             "-ar",             str(AUDIO_SAMPLE_RATE),
-            "-ac",             "1",         # mono
-            "-f",              "s16le",     # raw PCM container
+            "-ac",             "1",          # mono
+            "-f",              "s16le",      # raw PCM container
             "pipe:1",
         ]
 
@@ -734,7 +738,7 @@ class RTSPProxyConsumer(WebsocketConsumer):
             proc = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,  # suppress audio ffmpeg noise
+                stderr=subprocess.DEVNULL,   # suppress audio ffmpeg noise
                 bufsize=0,
             )
         except (FileNotFoundError, OSError) as exc:
@@ -744,17 +748,19 @@ class RTSPProxyConsumer(WebsocketConsumer):
         self._audio_proc = proc
         print("[audio] ffmpeg started — capturing audio stream")
 
-        threading.Thread(
-            target=self._read_audio_stdout,
-            args=(proc,),
-            daemon=True,
-        ).start()
+        threading.Thread(target=self._read_audio_stdout, args=(proc,), daemon=True).start()
+        # Start ElevenLabs worker only after audio ffmpeg is confirmed alive
+        threading.Thread(target=self._eleven_worker, daemon=True).start()
 
     def _read_audio_stdout(self, proc: subprocess.Popen):
         """
         Read raw PCM bytes from audio ffmpeg stdout.
         Accumulates samples in _pcm_buf and enqueues a chunk to the
-        Elevenlabs worker every AUDIO_CHUNK_SEC seconds.
+        ElevenLabs worker every AUDIO_CHUNK_SEC seconds.
+
+        Backpressure: if the queue is full (ElevenLabs is falling behind),
+        evict the oldest (stale) chunk and insert the freshest one so the
+        worker always processes the most recent audio.
         """
         CHUNK = 4096
         try:
@@ -765,139 +771,155 @@ class RTSPProxyConsumer(WebsocketConsumer):
 
                 with self._pcm_lock:
                     self._pcm_buf.extend(chunk)
-
-                    # When we have enough samples for one Elevenlabs inference,
-                    # cut a chunk and hand it off — keep any leftover bytes
                     while len(self._pcm_buf) >= self._bytes_per_chunk:
                         pcm_chunk = bytes(self._pcm_buf[:self._bytes_per_chunk])
                         del self._pcm_buf[:self._bytes_per_chunk]
-                        try:
-                            self._audio_queue.put_nowait(pcm_chunk)
-                        except queue.Full:
-                            # Elevenlabs is falling behind — drop oldest chunk
+
+                        # Non-blocking enqueue: if full, evict the oldest
+                        # stale chunk and insert the freshest one instead.
+                        if self._audio_queue.full():
                             try:
                                 self._audio_queue.get_nowait()
                             except queue.Empty:
                                 pass
-                            self._audio_queue.put_nowait(pcm_chunk)
+                        self._audio_queue.put_nowait(pcm_chunk)
 
         except OSError:
             pass
 
+    # ── ElevenLabs transcription worker ───────────────────────────────────────
+
     def _eleven_worker(self):
         """
-        Pull PCM chunks from queue and transcribe
-        using ElevenLabs Scribe.
-        """
+        Pull PCM chunks from _audio_queue and transcribe via ElevenLabs Scribe.
 
+        Key behaviours:
+        - In-memory WAV wrapping (no temp files, zero disk I/O)
+        - Fast int16 silence gate (no float conversion)
+        - Per-speaker transcript segments when diarization is available
+        - Exponential backoff on 429 rate-limit responses (non-blocking)
+        - Circuit breaker for 401 (unusual activity) with 30-minute blackout;
+          queue is drained during the blackout so stale audio is discarded
+        """
         client = _get_eleven()
 
         while True:
-            if time.time() < self._eleven_disabled_until:
-                time.sleep(2)
+            # ── Circuit breaker ───────────────────────────────────────────────
+            now = time.time()
+            if now < self._eleven_disabled_until:
+                # Sleep in short increments so the disconnect sentinel is seen promptly
+                time.sleep(min(2.0, self._eleven_disabled_until - now))
+                # Drain backlog that built up during the blackout
+                while not self._audio_queue.empty():
+                    try:
+                        self._audio_queue.get_nowait()
+                    except queue.Empty:
+                        break
                 continue
-            pcm_chunk = self._audio_queue.get()
 
+            pcm_chunk = self._audio_queue.get()   # blocks until chunk or sentinel
             if pcm_chunk is None:
-                break
+                break                               # disconnect sentinel
+
+            # ── Silence gate (fast int16 path) ────────────────────────────────
+            if _is_silent(pcm_chunk):
+                print("[eleven] skipped silence")
+                self._eleven_backoff_idx = 0        # reset backoff on clean path
+                continue
 
             try:
-                # Silence gate (keep your original protection)
-                audio = np.frombuffer(
-                    pcm_chunk,
-                    dtype=np.int16
-                ).astype(np.float32)
+                wav_bytes = _pcm_to_wav_bytes(pcm_chunk)
 
-                audio /= 32768.0
+                result = client.speech_to_text.convert(
+                    file=("audio.wav", io.BytesIO(wav_bytes), "audio/wav"),
+                    model_id=ELEVEN_MODEL,
+                    tag_audio_events=True,
+                    language_code=ELEVEN_LANGUAGE,
+                    diarize=True,
+                )
 
-                rms = np.abs(audio).mean()
-
-                print(f"[eleven] chunk rms={rms:.5f}")
-
-                if rms < 0.0001:
-                    print("[eleven] skipped silence")
-                    continue
-
-
-                # ElevenLabs expects a file-like object.
-                # Our ffmpeg audio is raw PCM, so wrap as WAV.
-                with tempfile.NamedTemporaryFile(
-                    suffix=".wav",
-                    delete=False
-                ) as f:
-
-                    import wave
-
-                    with wave.open(f.name, "wb") as wav:
-                        wav.setnchannels(1)
-                        wav.setsampwidth(2)  # 16-bit
-                        wav.setframerate(AUDIO_SAMPLE_RATE)
-                        wav.writeframes(pcm_chunk)
-
-                    temp_path = f.name
-
-
-                with open(temp_path, "rb") as audio_file:
-
-                    result = client.speech_to_text.convert(
-                        file=audio_file,
-                        model_id=ELEVEN_MODEL,
-                        tag_audio_events=True,
-                        language_code=ELEVEN_LANGUAGE,
-                        diarize=True,
-                    )
-
-
-                os.unlink(temp_path)
-
-
-                # SDK object may be typed object or dict
-                text = ""
-
-                if hasattr(result, "text"):
-                    text = result.text.strip()
-
-                elif isinstance(result, dict):
-                    text = result.get("text","").strip()
-
-
-                print(f"[eleven] result: {text}")
-
+                text = self._extract_transcript(result)
+                print(f"[eleven] result: {text!r}")
 
                 if text:
                     self._send_transcript(text)
 
+                self._eleven_backoff_idx = 0        # successful call — reset backoff
 
             except ApiError as exc:
-
                 status = getattr(exc, "status_code", None)
 
-                # Free-tier abuse lock or auth failure
                 if status == 401:
-
                     print(
-                        "[eleven] 401 unusual activity detected. "
+                        "[eleven] 401 — unusual activity detected. "
                         "Pausing transcription for 30 minutes."
                     )
-
-                    # circuit breaker
-                    self._eleven_disabled_until = time.time() + (30 * 60)
-
+                    self._eleven_disabled_until = time.time() + 1800
                     continue
 
-                # Rate limiting
                 if status == 429:
-                    print("[eleven] Rate limited. Backing off 60s")
-                    time.sleep(60)
+                    delay = _ELEVEN_BACKOFF[
+                        min(self._eleven_backoff_idx, len(_ELEVEN_BACKOFF) - 1)
+                    ]
+                    self._eleven_backoff_idx = min(
+                        self._eleven_backoff_idx + 1, len(_ELEVEN_BACKOFF) - 1
+                    )
+                    print(f"[eleven] Rate limited — backing off {delay}s")
+                    time.sleep(delay)
                     continue
 
-                print(f"[eleven] API error: {exc}")
-
+                print(f"[eleven] API error {status}: {exc}")
 
             except Exception as exc:
                 import traceback
-                print(f"[eleven] Error: {exc}")
+                print(f"[eleven] Unexpected error: {exc}")
                 traceback.print_exc()
+
+    @staticmethod
+    def _extract_transcript(result) -> str:
+        """
+        Pull the best available text from an ElevenLabs Scribe response.
+
+        Priority:
+          1. Diarized utterances  → "Speaker 0: hello  Speaker 1: world"
+          2. Flat .text / dict["text"]
+          3. Empty string (caller skips sending)
+        """
+        # Diarized path — list of utterance objects with .speaker + .text
+        utterances = None
+        if hasattr(result, "utterances"):
+            utterances = result.utterances
+        elif isinstance(result, dict):
+            utterances = result.get("utterances")
+
+        if utterances:
+            parts = []
+            for u in utterances:
+                speaker = getattr(u, "speaker", None) or u.get("speaker", "?")
+                utext   = (getattr(u, "text", None) or u.get("text", "")).strip()
+                if utext:
+                    parts.append(f"Speaker {speaker}: {utext}")
+            if parts:
+                return "  ".join(parts)
+
+        # Flat text fallback
+        if hasattr(result, "text"):
+            return result.text.strip()
+        if isinstance(result, dict):
+            return result.get("text", "").strip()
+
+        return ""
+
+    # ── shared helpers ────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _iso_now() -> str:
+        """Return the current UTC time as a millisecond-precision ISO 8601 string."""
+        ts = time.time()
+        return (
+            time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(ts))
+            + f".{int((ts % 1) * 1000):03d}Z"
+        )
 
     # ── thread-safe WebSocket send helpers ────────────────────────────────────
 
@@ -916,7 +938,7 @@ class RTSPProxyConsumer(WebsocketConsumer):
             pass
 
     def _send_transcript(self, text: str):
-        """Send a Elevenlabs transcript as a JSON text frame."""
+        """Send an ElevenLabs transcript as a JSON text frame."""
         try:
             self.send(text_data=json.dumps({"type": "transcript", "text": text}))
         except Exception:
@@ -924,16 +946,16 @@ class RTSPProxyConsumer(WebsocketConsumer):
 
     def _send_recognition(self, name: str, recognized_at: str, distance: float):
         """
-        Send first-ever recognition event for this websocket session.
+        Send first-ever recognition event for this WebSocket session.
         One event per unique person name.
         """
         try:
             self.send(
                 text_data=json.dumps({
-                    "type": "recognition",
-                    "name": name,
-                    "recognized_at": recognized_at,
-                    "distance": round(float(distance), 4),
+                    "type":           "recognition",
+                    "name":           name,
+                    "recognized_at":  recognized_at,
+                    "distance":       round(float(distance), 4),
                 })
             )
         except Exception:

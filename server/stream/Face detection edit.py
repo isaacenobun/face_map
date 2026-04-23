@@ -11,7 +11,7 @@ from scipy.spatial.distance import cosine
 # ─────────────────────────────────────────────
 # Configuration
 # ─────────────────────────────────────────────
-RTSP_URL      = "rtsp://admin:trace321@192.168.100.64:554/Streaming/Channels/101"
+RTSP_URL      = "rtsp://admin:trace321@192.168.1.64:554/Streaming/Channels/101"
 DB_PATH       = "faces.npz"
 MATCH_THRESH  = 0.4          # cosine distance threshold
 RECOG_FPS     = 24         # max recognition passes per second
