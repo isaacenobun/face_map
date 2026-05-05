@@ -44,7 +44,7 @@ from .models import FaceMap
 
 # ── stream / recognition config ───────────────────────────────────────────────
 DEFAULT_RTSP_URL = "rtsp://admin:trace321@192.168.1.64:554/Streaming/Channels/101"
-FPS              = 10           # ffmpeg output frame rate
+FPS              = 24           # ffmpeg output frame rate
 SCALE            = "1280:-1"    # higher res → better face detail for recognition
                                  # use "640:-1" if CPU can't keep up
 RECOG_FPS        = 6            # max face-recognition passes per second

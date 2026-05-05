@@ -1,0 +1,16 @@
+FROM python:3.11-slim
+WORKDIR /app
+
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && \
+    update-ca-certificates && rm -rf /var/lib/apt/lists/*
+
+COPY . /app
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Create a tiny HTTP health server
+RUN echo "from http.server import SimpleHTTPRequestHandler, HTTPServer; HTTPServer(('0.0.0.0', 8080), SimpleHTTPRequestHandler).serve_forever()" > /app/health.py
+
+CMD python manage.py qcluster & python health.py
